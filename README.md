@@ -1,205 +1,110 @@
-# Hyundai Card Coupon-issue optimization
+# 🚀 Hyundai Card Coupon-Issue Optimization
 
-### Problem
-```
-현대카드는 자체 업무뿐만 아니라 외부 커머스 업체의 거래도 처리함.
-A 고객사의 실시간 난수 쿠폰 발행 업무에서 쿠폰발행 오류가 발생.
-쿠폰 발행 과정에서 시에 다수의 트랜잭션이 동시에 거래가 인입되면
-(트랜잭션속도 기존 약 150ms) DML 작업 중 데드락(Deadlock)이 발생하여 
-첫 번째 거래를 제외한 나머지 거래가 자동으로 취소되는 문제.
-이를 해결하기 위해 최적화가 필요.
-```
+[![Java](https://img.shields.io/badge/Java-backend-%23ED8B00.svg?style=for-the-badge&logo=java&logoColor=white)]()
+[![Oracle](https://img.shields.io/badge/Oracle-DB-%23F80000.svg?style=for-the-badge&logo=oracle&logoColor=white)]()
+[![SQL](https://img.shields.io/badge/SQL-Optimization-%23007ACC.svg?style=for-the-badge&logo=sqlite&logoColor=white)]()
 
-### Causes
-오류가 발생한 원인은 3가지 정도로 분류 가능
-- 
-(1) 동일한 쿠폰을 동시에 업데이트하는 트랜잭션 충돌
+> 현대카드 쿠폰 발급 API에서 발생한 **동시성 문제 및 Deadlock 이슈**를 해결한 최적화 프로젝트입니다.
+
+> **Note**: 본 프로젝트는 사내 전용 시스템으로 실제 코드는 공개하지 않습니다.  
+> 기술 구조 및 역할 위주로 정리된 문서 기반 포트폴리오입니다.  
+> 본 문서의 코드는 **설명용 예시**이며, 실제 구현 코드와는 다를 수 있습니다.
+
+---
+
+## 🧩 문제 개요
+
+A 커머스 고객사의 **실시간 난수 쿠폰 발행 API**에서  
+다수 트랜잭션 동시 인입 시 Deadlock으로 인해 거래 실패가 빈번히 발생.
+
+- 기존 트랜잭션 속도: 약 **150ms**
+- 쿠폰 업데이트/삽입 시 **Lock 경합 → Deadlock 발생**
+- 결과적으로 쿠폰 발급 실패 및 dup 오류 증가
+
+---
+
+## ⚠️ 주요 원인 분석
+
+### 1. 동일 쿠폰 ID를 동시에 업데이트
 ```sql
-여러 트랜잭션이 동일한 쿠폰 ID를 동시에 업데이트하려고 
-시도하면서 행(row) 잠금(Lock) 경합이 발생.
-트랜잭션 간 락 해제가 늦어지면서 교착 상태(Deadlock)에 빠짐.
-```
-- sql 예시
-```sql
--- 트랜잭션 1
-BEGIN;
 SELECT * FROM coupon WHERE id = 100 FOR UPDATE;
 UPDATE coupon SET is_used = 1 WHERE id = 100;
-COMMIT;
-
--- 트랜잭션 2 (거의 동시에 실행)
-BEGIN;
-SELECT * FROM coupon WHERE id = 100 FOR UPDATE; -- 트랜잭션 1이 완료될 때까지 대기
-UPDATE coupon SET is_used = 1 WHERE id = 100;
-COMMIT;
 ```
 
-(2) PK(기본 키) 생성 방식이 idx+1 증가 방식으로 동시성 충돌 유발
-```
-여러 트랜잭션이 PK를 idx+1 방식으로 생성하려다 충돌 발생.
-동일한 ID를 동시에 삽입하려는 경쟁 상태(Race Condition)로 인해 
-PK 중복 오류 및 트랜잭션 충돌 발생.
-```
-- sql예시
+### 2. PK 충돌 (idx+1 방식)
 ```sql
--- 트랜잭션 1
-BEGIN;
-SELECT MAX(id) INTO @newId FROM coupon; 
-INSERT INTO coupon (id, code, is_used) VALUES (@newId + 1, 'COUPON123', 0);
-COMMIT;
+SELECT MAX(id) INTO @newId FROM coupon;
+INSERT INTO coupon (id) VALUES (@newId + 1);
+```
 
--- 트랜잭션 2 (거의 동시에 실행)
-BEGIN;
-SELECT MAX(id) INTO @newId FROM coupon; 
-INSERT INTO coupon (id, code, is_used) VALUES (@newId + 1, 'COUPON456', 0);
-COMMIT;
-```
-(3) 데이터 조회 후 업데이트 수행하는 방식에서 경쟁 조건 발생
+### 3. `is_used = 0` 쿠폰 조회 후 업데이트
 ```sql
-SELECT * FROM coupon WHERE is_used = 0 LIMIT 1으로 쿠폰을 조회 후, 
-같은 쿠폰을 여러 트랜잭션이 동시에 업데이트하려 함.
-한 트랜잭션이 업데이트를 완료하기 전에 다른 트랜잭션이 동일한 쿠폰을 조회하면서 다중 트랜잭션 충돌 및 데드락 발생.
+SELECT * FROM coupon WHERE is_used = 0 LIMIT 1;
+UPDATE coupon SET is_used = 1 WHERE id = ?;
 ```
-- java 예시
+
+### 4. Java 트랜잭션 처리 중 경쟁 조건
 ```java
-public void issueCoupon(Long couponId) {
-    Connection conn = dataSource.getConnection();
-    try {
-        conn.setAutoCommit(false);
-
-        // 동일한 쿠폰을 여러 스레드가 동시에 선택하려 하면 데드락 발생 가능
-        PreparedStatement ps = conn.selectDB1000A;
-        ps.setLong(1, couponId);
-        ResultSet rs = ps.executeQuery();
-
-        if (rs.next()) {
-            PreparedStatement updatePs = conn.updateDB1000A;
-            updatePs.setLong(1, couponId);
-            updatePs.executeUpdate();
-        }
-
-        conn.commit();
-    } catch (Exception e) {
-        conn.rollback();
-    } finally {
-        conn.close();
-    }
-}
+conn.setAutoCommit(false);
+PreparedStatement ps = conn.selectDB1000A;
+ResultSet rs = ps.executeQuery();
 ```
 
-### Solution
-(1) 거래 속도 분석 및 최적화
-```java
-트랜잭션 실행 시간을 로깅하여 평균 속도 분석.
-CPU 및 I/O 부하를 줄이기 위해 불필요한 DB 연산 최소화.
-네트워크 병목 현상 제거 (Batch Processing 적용).
+---
 
-long startTime = System.currentTimeMillis();
-try {
-    bcBCCCupnMng.issueCupn();
-}
-long endTime = System.currentTimeMillis();
-logger.debug("Transaction Time: {} ms", (endTime - startTime));
+## 🔧 해결 전략
 
-private void issueCupn(bcBCCCupnMng01 in) {
-    ...
-    if("R".equals(in.getCupnCd()) {
-        out = db1000.selectUpdateA(db1000In);
-        if(out == null) {
-            // 에러처리
-        }
-    } else if ("S".equals(in.getCupnCd()) {
-        out = db1000.selectUpdateB(db1000In);
-        if(out == null) {
-            // 에러처리
-        }
-    }
-    ...
-}
-```
-(2) 랜덤 쿠폰 추출을 통한 PK 충돌 해결
+### ✅ 트랜져션 시간 로깅 및 병목 제거  
+
+### ✅ 랜덤 쿠폰 추출 로직 전환  
+- **LAG() + SYSTIMESTAMP** 기반 추출 (중복 방지)
+- **DBMS_RANDOM**을 활용한 난수 기반 쿠폰 선택
+- **남은 쿠폰 수 동적 체크** 후 방식 전환
+
 ```sql
-기존 순차적 PK 증가 방식 (idx+1) 문제를 해결하기 위해 랜덤 방식으로 변경.
-모수가 클수록 오라클 자체 random함수 수행속도가 증가하여, 모수단위로 sql분리
-LAG() 함수를 활용하여 최근 발행된 쿠폰 데이터를 기반으로 난수 생성.
-
-/* 2-1  LAG() 기반 랜덤 쿠폰 추출 */
-LAG() 함수를 활용하여 이전에 발급된 쿠폰 데이터를 기반으로 난수 생성.
-SYSTIMESTAMP를 활용하여, 밀리초(ms) 단위의 변화를 기반으로 쿠폰을 선택함.
+-- LAG() 기반 추출
 SELECT id FROM (
-    SELECT id, LAG(id) OVER (ORDER BY SYSTIMESTAMP) AS prev_id
-    FROM coupon 
-    WHERE is_used = 0
+  SELECT id, LAG(id) OVER (ORDER BY SYSTIMESTAMP)
+  FROM coupon WHERE is_used = 0
 ) WHERE ROWNUM = 1;
+```
 
-/* 2-2 전체 쿠폰을 1000 이하일 경우 랜덤추출 */
-남은 쿠폰 모수가 1000개 이하일 경우,
-해당 그룹에서 난수를 기반으로 쿠폰을 추출.
-SELECT id FROM (
-    SELECT id 
-    FROM coupon 
-    WHERE is_used = 0 
-    ORDER BY MOD(DBMS_RANDOM.VALUE * 1000, 100)
-) WHERE ROWNUM = 1;
+### ✅ 파티셔닝을 통한 동시성 처리
 
-/* 2-3. 남은 쿠폰 수에 따른 동적 전환 로직 */
-DECLARE
-    remainingCoupons NUMBER;
-    selectedCouponID NUMBER;
-BEGIN
-    SELECT COUNT(*) INTO remainingCoupons FROM coupon WHERE is_used = 0;
-    
-    IF remainingCoupons > 100 THEN
-        SELECT id INTO selectedCouponID FROM (
-            SELECT id FROM coupon WHERE is_used = 0 ORDER BY MOD(DBMS_RANDOM.VALUE * 1000000, 100)
-        ) WHERE ROWNUM = 1;
-    ELSE
-        SELECT id INTO selectedCouponID FROM (
-            SELECT id, LAG(id) OVER (ORDER BY SYSTIMESTAMP) AS prev_id
-            FROM coupon WHERE is_used = 0
-        ) WHERE ROWNUM = 1;
-    END IF;
-    
-    UPDATE coupon SET is_used = 1 WHERE id = selectedCouponID;
-    COMMIT;
-END;
-/* 남은 쿠폰 개수를 확인 (COUNT(*) 사용).
-남은 쿠폰이 1000개 이상이라면 난수화 방식 적용(2-2).
-남은 쿠폰이 1000개 이하라면 LAG() 기반 SYSTIMESTAMP 방식 적용(2-1). */
-
-/* 2-4. 데이터 파티셔닝을 통한 동시 처리 개선
-메타데이터에 DB 파티션 추가  */
+```sql
 CREATE TABLE coupon (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    code VARCHAR(255),
-    is_used BOOLEAN
+  id BIGINT PRIMARY KEY,
+  ...
 ) PARTITION BY HASH(id) PARTITIONS 10;
-
-/* 쿠폰 테이블을 10개의 파티션으로 분할하여 동시성 개선.
-각 트랜잭션이 서로 다른 파티션에서 실행되도록 하여 DB 락 경쟁 완화.
-트랜잭션 부하를 자동으로 분배하여 대량의 요청을 동시에 처리 가능. */
-
-종합하여,
-밀리초(ms) 단위로 쿠폰을 선택하는 최적화 방식 도입.
-LAG() 및 SYSTIMESTAMP를 활용하여 연속적인 중복 방지
-1000개 이하 쿠폰 처리 시 성능 최적화.
-데이터 파티셔닝을 적용하여 동시 처리 능력 향상.
 ```
+> ➔ 파티셔닝 분산으로 Lock 충돌 완화 및 대량 요청 분산 처리
 
-#### Conclusion
-```
-실제 운영 서버는 API(앱 -> 백엔드) 수행이 비동기 처리로 최적화되어 있어 
-API 호출 이후 로직 수행과 발송 서버 전달까지만 측정.
+---
 
-기존 거래속도 약 150ms 사이에 동시 쿠폰발행시 DB 데드락 현상으로 인한
-쿠폰발급오류 발생 문제를 해결하기 위해 
+## 📊 참조 성과
+| 항목 | 감정 전 | 감정 후 |
+|------|---------|---------|
+| 트랜져션 평균 속도 | 150ms | **70~100ms** |
+| 쿠포드 dup 오류율 | 높음 | **대편 감소** |
+| 동시 처리 성능 | 낮음 | **파티셔닝 기반 향상** |
 
-1. 랜덤 쿠폰 추출 방식 적용, 
-2. 트랜잭션 동시성 관리 최적화, 
-3. 데이터 파티셔닝을 통한 부하 분산 등의 개선 작업을 수행하여 
-거래속도를 70~100ms로 약 50ms(33%)정도 단축시켰으며, dup에러를 최소화 시킴.
-이후에도 지속적으로 발생하는 특정 dup문제에 대해서는 이력테이블을 관리하여
-해당 고객에게 별도 알림등으로 처리하여 개선
-```
+- **트랜잭션 처리 속도 약 33% 단축**
+- **쿠폰 발급 오류 최소화 및 안정성 확률**
+- 일부 중복 이슈는 이력 테이블 관리 및 별도 알림 처리
 
+---
 
+## 📀 결론
+
+대규모 트랜잭션 처리 시스템에서의 Deadlock은  
+다른 하위 시스템으로 전달되기 위해
+대규모 실시간 서비스를 가정하고 분석하는 것이 해결 관건입니다.
+
+본 프로젝트에서는  
+1. **랜덤 쿠폰 추출 방식**,  
+2. **트랜잭션 충돌 회피 설계**,  
+3. **데이터 파티셔닝 기반 확장성**을 통해  
+**동시성 문제를 구조적으로 해결**했습니다.
+
+> 실제 운용 환경에서도 안정적으로 적용 완료되어있으며,  
+> 실시간 대량 트랜잭션에서의 문제 해결 경험으로 기록합니다.
